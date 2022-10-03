@@ -1,0 +1,130 @@
+create table tmp_export.payout_2203
+as select 
+d.done_dt
+,a.risk_flow_id
+,a.rule_set_map['306'] as score306
+, a.rule_set_map['488'] as score488
+,rule488.ruleset_488_score as score488_complement
+,o.id
+,o.user_id,o.account_id
+,from_unixtime(bigint(o.time_payout/1000-3600), 'yyyy-MM-dd' ) as time_payout
+,bigint(o.principal) as principal
+,overdue.index_id
+,overdue.billing_date
+,o.term_time_period
+,case  when a.rule_set_map['477']>0.54 and a.rule_set_map['477']<0.58 then '0.54-0.58_17.27%' --credit score_mob1(7)
+      when a.rule_set_map['477']>0.58 and a.rule_set_map['477']<0.63 then '0.58-0.63_19.64%'
+      when a.rule_set_map['477']>0.63 and a.rule_set_map['477']<0.67 then '0.63-0.67_31.98%'
+      when a.rule_set_map['477']>0.67 and a.rule_set_map['477']<0.1 then '0.67-1_43.48%'
+      end as score --credit score
+,case when (d.done_dt<='2022-04-02' and a.rule_set_map['306']<=0.4) or (d.done_dt>'2022-04-02' and  a.rule_set_map['488']<=0.47)  then 'low_will' --will score 306 and 488
+      else 'high_will'
+      end as will_bin
+from ods_ec.fdm_cash_loan_order o 
+join ec_dm.dm_ec_cashloan_user_first_loan_detail_data d on o.id= d.order_id 
+join ods_ec.fdm_ec_loan_user_risk_trace as r on o.account_id=r.loan_account_id and r.dt='${dt}' and r.risk_type='A'
+join ec_dw.dw_ec_risk_flow_trace_data as a on r.trace_id=a.trace_id
+left join risk_data.idn_rule_set_347 as rule488 on r.trace_id=rule488.traceid
+left join ec_dw.dw_ec_cashloan_instalment_overdue_data_detail as overdue on o.id=overdue.order_id
+
+where o.dt ='${dt}' and bigint(o.order_seq) = 1  and from_unixtime(bigint(o.time_payout/1000-3600),"yyyy-MM")='2022-03'
+and overdue.billing_date>='2022-04-01' and overdue.billing_date<'2022-05-01' 
+and ((o.term_time_period=15 and overdue.index_id=2 )  )
+
+
+
+
+
+
+
+
+
+from impala.dbapi import connect
+import getpass
+import pandas as pd
+import numpy as np
+email_address = getpass.getpass('enter_email:')
+password = getpass.getpass('enter_password:')
+
+##1.1 connect hive
+def get_conn(db_host, port, authMechanism, user, password):
+        return connect(host=db_host,
+                       port=port,
+                       auth_mechanism=authMechanism,
+                       user=user,
+                       password=password
+                       )
+cursor = get_conn(db_host='172.16.36.6', port=10030, authMechanism='LDAP', user=email_address, password=password)
+cursor = cursor.cursor()
+
+##1.2 pull data
+def read_data(sql):
+    cursor.execute(sql)
+    datas = cursor.fetchall()
+    cols = cursor.description
+    col=[]
+    for i in cols:
+        col.append(i[0])
+    df = pd.DataFrame(np.array(datas),columns=col)
+
+    print('success!')
+    return df
+
+pd.options.display.max_rows = None
+pd.options.display.max_columns = None
+
+
+sql="""select 
+'2203',
+'20220430' as time_get,
+t.score,
+count(distinct t.user_id) as user_count,
+sum(t1.principal) as principal,
+sum(t2.principal_repay) as principal_repay,
+sum(t2.interest) as interest, 
+sum(t2.post_interest_repay) as post_interest_repay, 
+sum(t2.overdue_interest_repay) as  overdue_interest_repay, 
+sum(t2.penalty_repay) as penalty_repay, 
+sum(case when t3.max_overdue_days >=1 then t1.principal- nvl(t2.principal_repay,0) else 0 end ) as yuqi1principal, 
+sum(case when t3.max_overdue_days >=8 then t1.principal- nvl(t2.principal_repay,0) else 0 end ) as yuqi8principal, 
+sum(case when t3.max_overdue_days >=1 and t3.max_overdue_days <= 7 then t1.principal- nvl(t2.principal_repay,0) else 0 end ) as yuqi1to7principal, 
+sum(case when t3.max_overdue_days is null then t1.principal- nvl(t2.principal_repay,0) else 0 end ) notdue_principal, 
+
+count(t.user_id)-count(distinct t.user_id) as  renew_count, 
+count(distinct case when t1.order_seq!=1 then t.user_id else null end) as  renew_people, 
+sum(t1.principal)-sum(case when t1.order_seq=1 then t1.principal else 0 end ) as  renew_principal, 
+
+ 
+count(distinct case when t3.max_overdue_days >=1 then t.user_id else null end )  as overdue_all, 
+count(distinct case when t3.max_overdue_days >=8 then t.user_id else null  end ) as overdue8plus, 
+(count(distinct t.user_id)-count(distinct case when t3.max_overdue_days >=8 then t.user_id else null  end ) ) as retained
+
+
+from  (select *
+,date_add(time_payout,30) as next_date 
+from tmp_export.payout_2203)    t
+left join 
+(select * from ec_dw.dw_ec_cashloan_order_billdate_stat  where (( datediff(from_unixtime(unix_timestamp(dt,'yyyymmdd'),'yyyy-mm-dd' ),from_unixtime(bigint(time_payout/1000-3600), 'yyyy-MM-dd' ))=30 and order_seq=1) or (order_seq!=1) )and status in ('R','C'))
+ t1 on t.user_id=t1.user_id  
+left join (select order_id,repay_time,
+                   sum(bigint(principal_repay)) as principal_repay 
+                   ,sum(bigint(interest)) as  interest  
+                   ,sum(bigint(post_interest_repay)) as  post_interest_repay 
+                   ,sum(bigint(overdue_interest_repay)) as  overdue_interest_repay 
+                   ,sum(bigint(penalty_repay)) as  penalty_repay  
+              from ec_dw.dw_ec_repayment_detail--dwd_ec_order_df_order_info
+             where sdk_type in ('N','X','R')
+             group by order_id,repay_time
+           )t2
+on t1.id = t2.order_id and  from_unixtime(cast(t2.repay_time/1000 as BIGINT)-3600,'yyyy-MM-dd') <=from_unixtime(unix_timestamp(t1.dt,'yyyymmdd'),'yyyy-mm-dd' )
+
+left join (SELECT order_id,instalment_id, 
+                  max(max_overdue_days) from ec_dwd.dwd_ec_order_df_instalment_overdue_event
+                  where from_unixtime(cast(t3.time_created/1000 as BIGINT)-3600,'yyyy-MM-dd') <=from_unixtime(unix_timestamp(t1.dt,'yyyymmdd'),'yyyy-mm-dd' ) 
+                  group by order_id
+            )t3
+on t1.id = t3.order_id  
+group by t.score"""#%tuple(['20220430']*4)
+
+
+d=read_data(sql)
